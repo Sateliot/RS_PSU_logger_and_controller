@@ -88,8 +88,13 @@ class App(tk.Tk):
         self.idn_label = ttk.Label(conn, text="Not connected")
         self.idn_label.grid(row=1, column=0, columnspan=4, padx=pad, pady=(0,pad), sticky="w")
 
-        chs = ttk.LabelFrame(self, text="Channels (CH1..CH3)")
-        chs.pack(fill="x", padx=pad, pady=pad)
+        # --- Create a horizontal container for Channels + Plot ---
+        main_hframe = ttk.Frame(self)
+        main_hframe.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        # Channels Frame (left half)
+        chs = ttk.LabelFrame(main_hframe, text="Channels (CH1..CH3)")
+        chs.pack(side="left", fill="both", expand=True, padx=(0, pad//2), pady=pad)
         headers = ["Channel","Voltage (V)","Current (A)","Apply V/I","Output","Soft P (W)","Hard P (W)","Set Limits"]
         for i,h in enumerate(headers):
             ttk.Label(chs, text=h, font=("",9,"bold")).grid(row=0, column=i, padx=4, pady=4)
@@ -117,8 +122,8 @@ class App(tk.Tk):
         ttk.Entry(gen, textvariable=self.poll_interval_var, width=8).grid(row=0, column=3, padx=4, pady=pad, sticky="w")
         ttk.Button(gen, text="Apply", command=self.push_interval).grid(row=0, column=4, padx=pad, pady=pad)
 
-        pc = ttk.LabelFrame(self, text="Live Plot & Logging")
-        pc.pack(fill="x", padx=pad, pady=pad)
+        pc = ttk.LabelFrame(main_hframe, text="Live Plot & Logging")
+        pc.pack(side="left", fill="both", expand=True, padx=(pad//2, 0), pady=pad)
         r = 0
         ttk.Label(pc, text="Select series to plot/log:").grid(row=r, column=0, padx=pad, pady=pad, sticky="w"); r += 1
         for c, ch in enumerate((1,2,3), start=1):
