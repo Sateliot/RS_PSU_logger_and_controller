@@ -1,666 +1,442 @@
-"""
-NGE103B 3-Channel GUI Controller with Live Plot (Tkinter + Matplotlib)
+#!/usr/bin/env python3
+# rs_psu_gui.py
+# GUI only: Tkinter + Matplotlib. Talks to worker via queues.
 
-Features:
-- Per-channel Voltage/Current set and output control.
-- Master output ON/OFF.
-- Per-channel measurement readback (V/I/P).
-- Live line plot with checkboxes to select series (V, A, P) per channel.
-- Adjustable sampling rate (seconds) for the plot & logging.
-- Start/Stop plot button.
-- On Start, ask for log file name (default = current date/time). Logs only the selected series to CSV.
-
-Requirements:
-- Python 3.8+
-- RsInstrument >= 1.53.0  (pip install RsInstrument)
-- R&S VISA installed and configured.
-- matplotlib (pip install matplotlib)
-
-Notes:
-- Default VISA resource string is prefilled; change it to match your device.
-- Soft limits assume typical NGE103B specs (0..32 V, 0..3 A). Adjust if your model differs.
-"""
-
-import csv
 import os
-import threading
-import time
+import csv
+import math
+import queue
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import ttk, messagebox, filedialog
 from collections import deque
 from datetime import datetime
 
-# Matplotlib for embedded plotting
+import multiprocessing as mp
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-try:
-    from RsInstrument import RsInstrument
-    RSINSTR_AVAILABLE = True
-except Exception as ex:
-    RsInstrument = None  # type: ignore
-    RSINSTR_AVAILABLE = False
+# Worker protocol
+from rs_psu_worker import (
+    Watchdog,
+    CMD_CONNECT, CMD_DISCONNECT, CMD_QUIT, CMD_SET_INTERVAL, CMD_SET_VI, CMD_TOGGLE_CH, CMD_MASTER, CMD_SET_LIMITS,
+    MSG_STATUS, MSG_CONNECTED, MSG_DISCONNECTED, MSG_MEAS, MSG_EVENT,
+    MAX_VOLT, MIN_VOLT, MAX_CURR, MIN_CURR
+)
 
-APP_TITLE = "R&S NGE103B GUI Controller + Plot"
-DEFAULT_RESOURCE = "USB0::0x0AAD::0x0197::5601.3800k03-112953::INSTR"  # Change if needed
-# Soft limits (edit to match your model/specs if needed)
-MAX_VOLT = 32.0
-MAX_CURR = 3.0
-MIN_VOLT = 0.0
-MIN_CURR = 0.0
+APP_TITLE = "R&S NGE103B GUI (Worker-owned VISA)"
+DEFAULT_RESOURCE = "USB0::0x0AAD::0x0197::5601.3800k03-112953::INSTR"
+PLOT_HISTORY_SEC = 300
+SOFT_LIM_SCALE = 0.90
+HARD_LIM_SCALE = 0.99
 
-PLOT_HISTORY_SEC = 300  # show last 5 minutes by default (based on sampling rate and x-limits update)
+def now_iso():
+    return datetime.utcnow().isoformat()
 
-SERIES_KEYS = [
-    ("CH1_V", 1, "V"),
-    ("CH1_I", 1, "I"),
-    ("CH1_P", 1, "P"),
-    ("CH2_V", 2, "V"),
-    ("CH2_I", 2, "I"),
-    ("CH2_P", 2, "P"),
-    ("CH3_V", 3, "V"),
-    ("CH3_I", 3, "I"),
-    ("CH3_P", 3, "P"),
-]
-
-class NGEGui(tk.Tk):
+class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        try:
-            self.state('zoomed')  # Windows
-        except:
-            self.attributes('-zoomed', True)  # macOS/Linux
         self.title(APP_TITLE)
-        self.geometry("1200x720")
+        try:
+            self.state("zoomed")
+        except Exception:
+            try: self.attributes("-zoomed", True)
+            except Exception: pass
+        self.geometry("1200x780")
         self.resizable(True, True)
 
+        # Queues + worker
+        self.cmd_q  = mp.Queue()
+        self.meas_q = mp.Queue()
+        self.worker = Watchdog(self.cmd_q, self.meas_q, init_interval=0.5)
+        self.worker.start()
+
         # State
-        self.inst = None
         self.connected = False
-
-        # Polling (simple readbacks) state
-        self.polling = tk.BooleanVar(value=False)
-        self.stop_poll_event = threading.Event()
-
-        # Plot state
-        self.plot_active = False
-        self.sample_interval_var = tk.StringVar(value="1.0")  # seconds
-        self.series_vars = {}  # key -> tk.BooleanVar
-        self.lines = {}        # key -> matplotlib line
-        self.buffers = {}      # key -> deque of (t, y)
+        self.poll_interval_var = tk.StringVar(value="0.5")   # worker sampling
+        self.plot_interval_var = tk.StringVar(value="0.5")   # repaint cadence
+        self.series_vars = {}
+        self.lines = {}
+        self.buffers = {}
         self.start_time = None
-        self.log_file = None
+        self.csv_file = None
         self.csv_writer = None
         self.csv_header = []
+        self.log_path = None
 
         self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        # background drains (non-blocking)
+        self.after(150, self._drain_messages_status)
+        self.after(200, self._drain_messages_plot_buffer)
 
-    # --------------------------- UI ---------------------------
+    # ---------- UI ----------
     def _build_ui(self):
-        pad = 10
+        pad = 8
 
-        # Connection Frame
         conn = ttk.LabelFrame(self, text="Connection")
-        conn.pack(fill="x", padx=pad, pady=(pad, 0))
-
+        conn.pack(fill="x", padx=pad, pady=(pad,0))
         ttk.Label(conn, text="VISA Resource:").grid(row=0, column=0, padx=pad, pady=pad, sticky="e")
         self.resource_var = tk.StringVar(value=DEFAULT_RESOURCE)
         ttk.Entry(conn, textvariable=self.resource_var, width=70).grid(row=0, column=1, padx=pad, pady=pad, sticky="w")
-
-        self.btn_connect = ttk.Button(conn, text="Connect", command=self.connect)
-        self.btn_connect.grid(row=0, column=2, padx=pad, pady=pad)
+        ttk.Button(conn, text="Connect", command=self.connect).grid(row=0, column=2, padx=pad, pady=pad)
         self.btn_disconnect = ttk.Button(conn, text="Disconnect", command=self.disconnect, state="disabled")
         self.btn_disconnect.grid(row=0, column=3, padx=pad, pady=pad)
-
         self.idn_label = ttk.Label(conn, text="Not connected")
-        self.idn_label.grid(row=1, column=0, columnspan=4, padx=pad, pady=(0, pad), sticky="w")
+        self.idn_label.grid(row=1, column=0, columnspan=4, padx=pad, pady=(0,pad), sticky="w")
 
-        # Channels Frame
         chs = ttk.LabelFrame(self, text="Channels (CH1..CH3)")
         chs.pack(fill="x", padx=pad, pady=pad)
-
-        headers = ["Channel", "Voltage (V)", "Current (A)", "Apply V/I", "Output ON/OFF", "Measured V (V)", "Measured I (A)", "Measured P (W)", "Soft Limit P (W)", "Hard Limit P (W)", "Set Limit (W)"]
-        for i, h in enumerate(headers):
-            ttk.Label(chs, text=h, font=("", 9, "bold")).grid(row=0, column=i, padx=4, pady=4)
-
+        headers = ["Channel","Voltage (V)","Current (A)","Apply V/I","Output","Soft P (W)","Hard P (W)","Set Limits"]
+        for i,h in enumerate(headers):
+            ttk.Label(chs, text=h, font=("",9,"bold")).grid(row=0, column=i, padx=4, pady=4)
         self.ch_vars = {}
-        for ch in (1, 2, 3):
-            row = ch
-            ttk.Label(chs, text=f"CH{ch}").grid(row=row, column=0, padx=4, pady=4)
+        for ch in (1,2,3):
+            r = ch
+            ttk.Label(chs, text=f"CH{ch}").grid(row=r, column=0, padx=4, pady=4)
+            v = tk.StringVar(value="0.0"); i = tk.StringVar(value="0.0")
+            ttk.Entry(chs, textvariable=v, width=10).grid(row=r, column=1, padx=4, pady=4)
+            ttk.Entry(chs, textvariable=i, width=10).grid(row=r, column=2, padx=4, pady=4)
+            ttk.Button(chs, text="Apply", command=lambda c=ch: self.apply_vi(c)).grid(row=r, column=3, padx=4, pady=4)
+            ttk.Button(chs, text="Toggle", command=lambda c=ch: self.toggle_ch(c)).grid(row=r, column=4, padx=4, pady=4)
+            soft = tk.StringVar(value="inf"); hard = tk.StringVar(value="inf")
+            ttk.Entry(chs, textvariable=soft, width=10).grid(row=r, column=5, padx=4, pady=4)
+            ttk.Entry(chs, textvariable=hard, width=10).grid(row=r, column=6, padx=4, pady=4)
+            ttk.Button(chs, text="Set", command=lambda c=ch: self.push_limits(c)).grid(row=r, column=7, padx=4, pady=4)
+            self.ch_vars[ch] = {"v": v, "i": i, "soft": soft, "hard": hard}
 
-            v_var = tk.StringVar(value="0.0")
-            i_var = tk.StringVar(value="0.0")
-            ttk.Entry(chs, textvariable=v_var, width=10).grid(row=row, column=1, padx=4, pady=4)
-            ttk.Entry(chs, textvariable=i_var, width=10).grid(row=row, column=2, padx=4, pady=4)
-
-            apply_btn = ttk.Button(chs, text="Apply", command=lambda c=ch: self.apply_vi(c))
-            apply_btn.grid(row=row, column=3, padx=4, pady=4)
-
-            out_btn = ttk.Button(chs, text="Toggle", command=lambda c=ch: self.toggle_channel_output(c))
-            out_btn.grid(row=row, column=4, padx=4, pady=4)
-
-            mv = ttk.Label(chs, text="—")
-            mi = ttk.Label(chs, text="—")
-            mp = ttk.Label(chs, text="—")
-
-            mv.grid(row=row, column=5, padx=4, pady=4)
-            mi.grid(row=row, column=6, padx=4, pady=4)
-            mp.grid(row=row, column=7, padx=4, pady=4)
-
-            soft_lim_var = tk.StringVar(value="0.0")
-            hard_lim_var = tk.StringVar(value="0.0")
-            ttk.Entry(chs, textvariable=soft_lim_var, width=10).grid(row=row, column=8, padx=4, pady=4)
-            ttk.Entry(chs, textvariable=hard_lim_var, width=10).grid(row=row, column=9, padx=4, pady=4)
-
-            setlim_btn = ttk.Button(chs, text="Set", command=lambda c=ch: self.set_lim(c))
-            setlim_btn.grid(row=row, column=10, padx=4, pady=4)
-
-            self.ch_vars[ch] = {
-                "v_var": v_var,
-                "i_var": i_var,
-                "mv": mv,
-                "mi": mi,
-                "mp": mp,
-                "soft_lim": soft_lim_var,
-                "hard_lim": hard_lim_var
-            }
-
-        # General Controls
-        gen = ttk.LabelFrame(self, text="General Output & Measurements")
+        gen = ttk.LabelFrame(self, text="General / Polling / Logging")
         gen.pack(fill="x", padx=pad, pady=pad)
+        self.btn_master_on  = ttk.Button(gen, text="Master ON",  command=lambda: self.master_out(True),  state="disabled")
+        self.btn_master_off = ttk.Button(gen, text="Master OFF", command=lambda: self.master_out(False), state="disabled")
+        self.btn_master_on.grid(row=0, column=0, padx=pad, pady=pad); self.btn_master_off.grid(row=0, column=1, padx=pad, pady=pad)
+        ttk.Label(gen, text="Polling interval (s):").grid(row=0, column=2, padx=pad, pady=pad, sticky="e")
+        ttk.Entry(gen, textvariable=self.poll_interval_var, width=8).grid(row=0, column=3, padx=4, pady=pad, sticky="w")
+        ttk.Button(gen, text="Apply", command=self.push_interval).grid(row=0, column=4, padx=pad, pady=pad)
 
-        self.btn_master_on = ttk.Button(gen, text="Master ON", command=lambda: self.master_output(1), state="disabled")
-        self.btn_master_on.grid(row=0, column=0, padx=pad, pady=pad)
-        self.btn_master_off = ttk.Button(gen, text="Master OFF", command=lambda: self.master_output(0), state="disabled")
-        self.btn_master_off.grid(row=0, column=1, padx=pad, pady=pad)
-
-        self.btn_read = ttk.Button(gen, text="Read Measurements (All CH)", command=self.read_all_measurements, state="disabled")
-        self.btn_read.grid(row=0, column=2, padx=pad, pady=pad)
-
-        ttk.Checkbutton(gen, text="Auto-poll every 1s", variable=self.polling, command=self.on_toggle_poll).grid(row=0, column=3, padx=pad, pady=pad)
-
-        # ---- Plot & Logging Controls ----
-        plot_controls = ttk.LabelFrame(self, text="Live Plot & Logging")
-        plot_controls.pack(fill="x", padx=pad, pady=pad)
-
-        # Checkboxes per channel/metric
-        grid_row = 0
-        ttk.Label(plot_controls, text="Select series to plot/log:").grid(row=grid_row, column=0, padx=pad, pady=pad, sticky="w")
-        grid_row += 1
-
-        # Headers for CH columns
+        pc = ttk.LabelFrame(self, text="Live Plot & Logging")
+        pc.pack(fill="x", padx=pad, pady=pad)
+        r = 0
+        ttk.Label(pc, text="Select series to plot/log:").grid(row=r, column=0, padx=pad, pady=pad, sticky="w"); r += 1
         for c, ch in enumerate((1,2,3), start=1):
-            ttk.Label(plot_controls, text=f"CH{ch}", font=("", 9, "bold")).grid(row=grid_row, column=c, padx=4, pady=4)
-        grid_row += 1
-
-        # Rows for V, I, P
-        for metric in ("V", "I", "P"):
-            ttk.Label(plot_controls, text=metric).grid(row=grid_row, column=0, padx=4, pady=4, sticky="e")
+            ttk.Label(pc, text=f"CH{ch}", font=("",9,"bold")).grid(row=r, column=c, padx=4, pady=4)
+        r += 1
+        for m in ("V","I","P"):
+            ttk.Label(pc, text=m).grid(row=r, column=0, padx=4, pady=4, sticky="e")
             for c, ch in enumerate((1,2,3), start=1):
-                key = f"CH{ch}_{'V' if metric=='V' else ('I' if metric=='I' else 'P')}"
-                var = tk.BooleanVar(value=(metric == "V" and ch == 1))  # default only CH1_V selected
+                key = f"CH{ch}_{m}"
+                var = tk.BooleanVar(value=(m=="V" and ch==1))
                 self.series_vars[key] = var
-                ttk.Checkbutton(plot_controls, variable=var).grid(row=grid_row, column=c, padx=4, pady=4)
-            grid_row += 1
+                ttk.Checkbutton(pc, variable=var).grid(row=r, column=c, padx=4, pady=4)
+            r += 1
 
-        # Sampling interval
-        ttk.Label(plot_controls, text="Sampling interval (s):").grid(row=grid_row, column=0, padx=pad, pady=pad, sticky="e")
-        ttk.Entry(plot_controls, textvariable=self.sample_interval_var, width=8).grid(row=grid_row, column=1, padx=4, pady=pad, sticky="w")
-        grid_row += 1
+        ttk.Label(pc, text="Plot repaint interval (s):").grid(row=r, column=0, padx=pad, pady=pad, sticky="e")
+        ttk.Entry(pc, textvariable=self.plot_interval_var, width=8).grid(row=r, column=1, padx=4, pady=pad, sticky="w")
+        self.btn_plot = ttk.Button(pc, text="Start Plot & Log", command=self.toggle_plot, state="disabled")
+        self.btn_plot.grid(row=r, column=2, padx=pad, pady=pad, sticky="w")
 
-        # Start/Stop button
-        self.btn_plot_toggle = ttk.Button(plot_controls, text="Start Plot & Log", command=self.toggle_plot, state="disabled")
-        self.btn_plot_toggle.grid(row=grid_row, column=0, padx=pad, pady=pad, sticky="w")
-
-        # ---- Matplotlib Figure ----
-        self.figure = Figure(figsize=(10, 3.6), dpi=100)
+        self.figure = Figure(figsize=(10,3.6), dpi=100)
         self.ax = self.figure.add_subplot(111)
-        self.ax.set_title("Live Measurements")
-        self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("Value")
-        self.ax.grid(True)
-        self.ax.margins(x=2, y=2)
-
+        self.ax.set_title("Live Measurements"); self.ax.set_xlabel("Time (s)"); self.ax.set_ylabel("Value"); self.ax.grid(True)
+        self.ax.margins(x=0.02, y=0.05)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self)
         self.canvas_widget = self.canvas.get_tk_widget()
         self.canvas_widget.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
 
-        # Status bar
         self.status = ttk.Label(self, text="Ready.", relief="sunken", anchor="w")
         self.status.pack(fill="x", side="bottom")
 
-    # --------------------------- VISA/Instrument ---------------------------
+    # ---------- background drains ----------
+    def _drain_messages_status(self):
+        # Handle connection/state messages; push measurements back for plot loop
+        stash = []
+        while True:
+            try:
+                msg = self.meas_q.get_nowait()
+            except queue.Empty:
+                break
+            tp = msg.get("type")
+            if tp == MSG_STATUS:
+                self.status.config(text=msg.get("msg",""))
+                if not msg.get("ok", True) and "Connect failed" in msg.get("msg",""):
+                    messagebox.showerror("Connection", msg.get("msg",""))
+            elif tp == MSG_CONNECTED:
+                self.connected = True
+                self.idn_label.config(text=f"Connected: {msg.get('idn','')}")
+                self.btn_disconnect.config(state="normal")
+                self.btn_master_on.config(state="normal")
+                self.btn_master_off.config(state="normal")
+                self.btn_plot.config(state="normal")
+                self.status.config(text="Connected.")
+            elif tp == MSG_DISCONNECTED:
+                self.connected = False
+                self.idn_label.config(text="Not connected")
+                self.btn_disconnect.config(state="disabled")
+                self.btn_master_on.config(state="disabled")
+                self.btn_master_off.config(state="disabled")
+                self.btn_plot.config(state="disabled")
+                self.status.config(text="Disconnected.")
+            else:
+                stash.append(msg)  # meas/event kept for plot drain
+
+        # return non-status messages to queue (so plot loop can consume)
+        for m in stash:
+            try: self.meas_q.put_nowait(m)
+            except Exception: pass
+
+        self.after(200, self._drain_messages_status)
+
+    def _drain_messages_plot_buffer(self):
+        # This doesn’t draw; it just ensures the queue doesn’t pile up when not plotting
+        if not self.plot_active:
+            # Drop old measurement bursts (we only need the last few for a quick redraw later)
+            trimmed = 0
+            while True:
+                try:
+                    msg = self.meas_q.get_nowait()
+                except queue.Empty:
+                    break
+                if msg.get("type") in (MSG_MEAS, MSG_EVENT):
+                    trimmed += 1
+                # statuses will be handled by status drain; ignore here
+            if trimmed:
+                self.status.config(text=f"Buffered {trimmed} messages (idle).")
+        self.after(500, self._drain_messages_plot_buffer)
+
+    # ---------- Actions (send commands only) ----------
     def connect(self):
-        if not RSINSTR_AVAILABLE:
-            messagebox.showerror("RsInstrument missing", "RsInstrument is not installed or failed to import.\nInstall with:\n  pip install RsInstrument")
-            return
         res = self.resource_var.get().strip()
         if not res:
-            messagebox.showerror("Invalid resource", "Please enter a VISA resource string.")
-            return
-        try:
-            self.inst = RsInstrument(res, id_query=True, reset=True, options="SelectVisa='rs',")
-            self.inst.assert_minimum_version("1.53.0")
-            idn = self.inst.query_str("*IDN?").strip()
-            self.idn_label.config(text=f"Connected: {idn}")
-            self.connected = True
-            self.status.config(text="Connected.")
-            self.btn_connect.config(state="disabled")
-            self.btn_disconnect.config(state="normal")
-            self.btn_master_on.config(state="normal")
-            self.btn_master_off.config(state="normal")
-            self.btn_read.config(state="normal")
-            self.btn_plot_toggle.config(state="normal")
-        except Exception as ex:
-            self.inst = None
-            self.connected = False
-            messagebox.showerror("Connection failed", f"Could not connect:\n{ex}")
-            self.status.config(text="Connection failed.")
+            messagebox.showerror("VISA", "Enter a VISA resource"); return
+        self.cmd_q.put({"type": CMD_CONNECT, "resource": res})
+        self.status.config(text="Connecting…")
 
     def disconnect(self):
+        self.cmd_q.put({"type": CMD_DISCONNECT})
+        self.status.config(text="Disconnecting…")
+
+    def master_out(self, on: bool):
+        if not self.connected: messagebox.showwarning("Not connected","Connect first."); return
+        self.cmd_q.put({"type": CMD_MASTER, "on": bool(on)})
+
+    def push_interval(self):
         try:
-            self.stop_poll()
-            self.stop_plot()
-            if self.inst is not None:
-                # Safe master OFF before closing (optional; comment if undesired)
-                try:
-                    self.inst.write("OUTPut:GENeral 0")
-                except Exception:
-                    pass
-                self.inst.close()
+            val = float(self.poll_interval_var.get())
+            if val <= 0: raise ValueError
+            self.cmd_q.put({"type": CMD_SET_INTERVAL, "interval": val})
+            self.status.config(text=f"Polling interval set to {val}s")
         except Exception:
-            pass
-        self.inst = None
-        self.connected = False
-        self.idn_label.config(text="Not connected")
-        self.btn_connect.config(state="normal")
-        self.btn_disconnect.config(state="disabled")
-        self.btn_master_on.config(state="disabled")
-        self.btn_master_off.config(state="disabled")
-        self.btn_read.config(state="disabled")
-        self.btn_plot_toggle.config(state="disabled")
-        self.status.config(text="Disconnected.")
+            messagebox.showerror("Interval","Enter a positive number")
 
-    def on_close(self):
-        try:
-            self.disconnect()
-        finally:
-            self.destroy()
-
-    # --------------------------- Helpers ---------------------------
-    def _validate_vi(self, v_str: str, i_str: str):
-        try:
-            v = float(v_str)
-            i = float(i_str)
-        except ValueError:
-            raise ValueError("Voltage/Current must be numeric.")
-        if not (MIN_VOLT <= v <= MAX_VOLT):
-            raise ValueError(f"Voltage out of range [{MIN_VOLT}, {MAX_VOLT}] V.")
-        if not (MIN_CURR <= i <= MAX_CURR):
-            raise ValueError(f"Current out of range [{MIN_CURR}, {MAX_CURR}] A.")
-        return v, i
-
-    def _scpi_select_ch(self, ch: int):
-        if self.inst is None:
-            raise RuntimeError("Not connected.")
-        self.inst.write(f"INSTrument:NSELect {ch}")
-
-    # --------------------------- Actions ---------------------------
     def apply_vi(self, ch: int):
-        if not self.connected or self.inst is None:
-            messagebox.showwarning("Not connected", "Connect to the instrument first.")
-            return
-        v_str = self.ch_vars[ch]["v_var"].get()
-        i_str = self.ch_vars[ch]["i_var"].get()
+        if not self.connected: messagebox.showwarning("Not connected","Connect first."); return
         try:
-            v, i = self._validate_vi(v_str, i_str)
-        except Exception as ex:
-            messagebox.showerror("Invalid input", str(ex))
-            return
+            v = float(self.ch_vars[ch]["v"].get()); i = float(self.ch_vars[ch]["i"].get())
+        except Exception:
+            messagebox.showerror("Input","V/I must be numeric"); return
+        if not (MIN_VOLT<=v<=MAX_VOLT): messagebox.showerror("Voltage",f"Range [{MIN_VOLT},{MAX_VOLT}]"); return
+        if not (MIN_CURR<=i<=MAX_CURR): messagebox.showerror("Current",f"Range [{MIN_CURR},{MAX_CURR}]"); return
+        self.cmd_q.put({"type": CMD_SET_VI, "ch": ch, "v": v, "i": i})
+        # suggest limits and push
+        p = v*i
+        self.ch_vars[ch]["soft"].set(f"{SOFT_LIM_SCALE*p:.3f}")
+        self.ch_vars[ch]["hard"].set(f"{HARD_LIM_SCALE*p:.3f}")
+        self.push_limits(ch)
+
+    def toggle_ch(self, ch: int):
+        if not self.connected: messagebox.showwarning("Not connected","Connect first."); return
+        self.cmd_q.put({"type": CMD_TOGGLE_CH, "ch": ch})
+
+    def push_limits(self, ch: int):
+        soft = self.ch_vars[ch]["soft"].get()
+        hard = self.ch_vars[ch]["hard"].get()
+        # Optional sanity (if both finite): 0 ≤ soft ≤ hard ≤ min(V*I, ABSOLUTE_MAX_PWR)
         try:
-            self._scpi_select_ch(ch)
-            self.inst.write(f"SOURce:VOLTage:LEVel:IMMediate:AMPLitude {v}")
-            self.inst.write(f"SOURce:CURRent:LEVel:IMMediate:AMPLitude {i}")
-            # Optional: OPC sync
-            self.inst.query_opc()
-            self.status.config(text=f"CH{ch}: Set V={v:.3f} V, I={i:.3f} A")
-        except Exception as ex:
-            messagebox.showerror("SCPI Error", f"Failed to set CH{ch}:\n{ex}")
+            s = float(soft); h = float(hard)
+            v = float(self.ch_vars[ch]["v"].get()); i = float(self.ch_vars[ch]["i"].get())
+            pmax = v*i if v*i > 0 else math.inf
+            if not (0.0 <= s <= h <= pmax):
+                messagebox.showerror("Limits", f"CH{ch}: 0 ≤ soft ≤ hard ≤ {pmax:.3f} W"); return
+        except Exception:
+            pass  # allow "inf" or blanks
+        self.cmd_q.put({"type": CMD_SET_LIMITS, "ch": ch, "soft": soft, "hard": hard})
+        self.status.config(text=f"CH{ch} limits set.")
 
-    def set_lim(self, ch: int):
-        pass
-
-    def toggle_channel_output(self, ch: int):
-        if not self.connected or self.inst is None:
-            messagebox.showwarning("Not connected", "Connect to the instrument first.")
-            return
-        try:
-            self._scpi_select_ch(ch)
-            try:
-                state = int(self.inst.query_str("OUTPut:STATe?").strip())
-                new_state = 0 if state else 1
-            except Exception:
-                state = 0
-                new_state = 1
-            self.inst.write(f"OUTPut:STATe {new_state}")
-            self.status.config(text=f"CH{ch} Output {'ON' if new_state else 'OFF'}")
-        except Exception as ex:
-            messagebox.showerror("SCPI Error", f"Failed to toggle CH{ch} output:\n{ex}")
-
-    def master_output(self, onoff: int):
-        if not self.connected or self.inst is None:
-            messagebox.showwarning("Not connected", "Connect to the instrument first.")
-            return
-        try:
-            self.inst.write(f"OUTPut:GENeral {1 if onoff else 0}")
-            self.status.config(text=f"Master Output {'ON' if onoff else 'OFF'}")
-        except Exception as ex:
-            messagebox.showerror("SCPI Error", f"Failed to set master output:\n{ex}")
-
-    def read_all_measurements(self):
-        if not self.connected or self.inst is None:
-            messagebox.showwarning("Not connected", "Connect to the instrument first.")
-            return
-        try:
-            for ch in (1, 2, 3):
-                self._scpi_select_ch(ch)
-                v = self.inst.query_str("MEASure:SCALar:VOLTage:DC?").strip()
-                i = self.inst.query_str("MEASure:SCALar:CURRent:DC?").strip()
-                p = self.inst.query_str("MEASure:SCALar:POWer?").strip()
-                self.ch_vars[ch]["mv"].config(text=v)
-                self.ch_vars[ch]["mi"].config(text=i)
-                self.ch_vars[ch]["mp"].config(text=p)
-            self.status.config(text="Measurements updated.")
-        except Exception as ex:
-            messagebox.showerror("SCPI Error", f"Failed to read measurements:\n{ex}")
-
-    # --------------------------- Polling ---------------------------
-    def on_toggle_poll(self):
-        if self.polling.get():
-            if not self.connected:
-                self.polling.set(False)
-                messagebox.showwarning("Not connected", "Connect first to enable auto-polling.")
-                return
-            self.start_poll()
-        else:
-            self.stop_poll()
-
-    def start_poll(self):
-        self.stop_poll_event.clear()
-        t = threading.Thread(target=self._poll_loop, daemon=True)
-        t.start()
-        self.status.config(text="Auto-polling started.")
-
-    def stop_poll(self):
-        self.stop_poll_event.set()
-        self.status.config(text="Auto-polling stopped.")
-
-    def _poll_loop(self):
-        while not self.stop_poll_event.is_set():
-            try:
-                self.read_all_measurements()
-            except Exception:
-                pass
-            for _ in range(10):
-                if self.stop_poll_event.is_set():
-                    break
-                time.sleep(0.1)
-
-    # --------------------------- Plot & Logging ---------------------------
+    # ---------- Plot & logging ----------
     def toggle_plot(self):
-        if not self.plot_active:
-            self.start_plot()
-        else:
-            self.stop_plot()
+        if not self.plot_active: self.start_plot()
+        else: self.stop_plot()
 
-    def _collect_selected_keys(self):
-        return [k for k, var in self.series_vars.items() if var.get()]
+    def _selected(self): return [k for k,v in self.series_vars.items() if v.get()]
 
     def start_plot(self):
-        if not self.connected or self.inst is None:
-            messagebox.showwarning("Not connected", "Connect to the instrument first.")
-            return
-
-        # Validate sampling interval
+        if not self.connected: messagebox.showwarning("Not connected","Connect first."); return
         try:
-            interval = float(self.sample_interval_var.get())
-            if interval <= 0:
-                raise ValueError
+            repaint = float(self.plot_interval_var.get()); assert repaint > 0
         except Exception:
-            messagebox.showerror("Invalid interval", "Sampling interval must be a positive number (seconds).")
-            return
+            messagebox.showerror("Plot interval","Must be a positive number"); return
 
-        selected = self._collect_selected_keys()
-        if not selected:
-            messagebox.showwarning("No series selected", "Select at least one series to plot/log.")
-            return
+        sel = self._selected()
+        if not sel:
+            messagebox.showwarning("No series","Select at least one series."); return
 
-        # Ask for log filename (default = current date/time)
         default_name = datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv"
-        initialdir = os.getcwd()
-        file_path = filedialog.asksaveasfilename(
-            title="Select log file",
-            defaultextension=".csv",
-            initialfile=default_name,
-            initialdir=initialdir,
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-        if not file_path:
-            # User canceled
-            return
+        path = filedialog.asksaveasfilename(title="Select log file", defaultextension=".csv",
+                                            initialfile=default_name, initialdir=os.getcwd(),
+                                            filetypes=[("CSV files","*.csv"),("All files","*.*")])
+        if not path: return
 
-        # Prepare buffers and lines
         self.start_time = time.time()
-        self.buffers = {k: deque(maxlen=100000) for k in selected}  # large cap; we trim view via x-limits
         self.ax.cla()
-        self.ax.set_title("Live Measurements")
-        self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("Value")
-        self.ax.grid(True)
+        self.ax.set_title("Live Measurements"); self.ax.set_xlabel("Time (s)"); self.ax.set_ylabel("Value"); self.ax.grid(True)
+        self.ax.margins(x=0.02, y=0.05)
         self.lines = {}
-        for key in selected:
-            line, = self.ax.plot([], [], label=key)  # use default colors
-            line.sticky_edges.x[:] = []
-            line.sticky_edges.y[:] = []
+        self.buffers = {k: deque(maxlen=100000) for k in sel}
+        for key in sel:
+            line, = self.ax.plot([], [], label=key)
+            try: line.sticky_edges.x[:]=[]; line.sticky_edges.y[:]=[]
+            except Exception: pass
             self.lines[key] = line
-        self.ax.legend(loc="upper left")
-        self.canvas.draw()
+        self.ax.legend(loc="upper left"); self.canvas.draw()
 
-        # Open CSV and write header
-        self.log_file = open(file_path, "w", newline="")
-        self.csv_writer = csv.writer(self.log_file)
-        self.csv_header = ["timestamp_iso", "t_rel_s"] + selected
-        self.csv_writer.writerow(self.csv_header)
+        self.log_path = path
+        self.csv_file = open(self.log_path, "w", newline="")
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_header = ["timestamp_iso","t_rel_s"] + sel + ["event","event_ch","event_v","event_i","event_p"]
+        self.csv_writer.writerow(self.csv_header); self.csv_file.flush()
 
-        # Set active + schedule first tick
         self.plot_active = True
-        self.btn_plot_toggle.config(text="Stop Plot & Log")
-        self.status.config(text=f"Plotting & logging to: {file_path}")
-        # Kick off loop
-        self.after(int(interval * 1000), self._plot_tick)
+        self.btn_plot.config(text="Stop Plot & Log")
+        self.status.config(text=f"Plotting & logging to: {self.log_path}")
+        self.after(int(repaint*1000), self._plot_tick)
 
     def stop_plot(self):
-        if not self.plot_active:
-            return
         self.plot_active = False
-        self.btn_plot_toggle.config(text="Start Plot & Log")
-        # Close log file if open
+        self.btn_plot.config(text="Start Plot & Log")
         try:
-            if self.log_file:
-                self.log_file.flush()
-                self.log_file.close()
-        except Exception:
-            pass
-        self.log_file = None
-        self.csv_writer = None
+            if self.csv_file: self.csv_file.flush(); self.csv_file.close()
+        except Exception: pass
+        self.csv_file = None; self.csv_writer = None
         self.status.config(text="Plotting stopped.")
 
-    def _parse_series_key(self, key):
-        # key like "CH1_V" -> (ch:int, metric:str)
-        ch = int(key[2])
-        metric = key[-1]  # V/I/P
-        return ch, metric
-
-    def _read_metrics_for_selection(self, selected_keys):
-        """
-        Reads only what is needed for the selected series.
-        Returns dict key->float value for all selected keys.
-        """
-        results = {}
-        # Group by channel to avoid extra selects
-        by_ch = {}
-        for key in selected_keys:
-            ch, metric = self._parse_series_key(key)
-            by_ch.setdefault(ch, set()).add(metric)
-
-        for ch, metrics in by_ch.items():
-            self._scpi_select_ch(ch)
-            # If multiple metrics are needed for this channel, read them appropriately
-            # We'll read only what is needed
-            if "V" in metrics:
-                try:
-                    v = float(self.inst.query_str("MEASure:SCALar:VOLTage:DC?").strip())
-                except Exception:
-                    v = float("nan")
-                results[f"CH{ch}_V"] = v
-            if "I" in metrics:
-                try:
-                    i = float(self.inst.query_str("MEASure:SCALar:CURRent:DC?").strip())
-                except Exception:
-                    i = float("nan")
-                results[f"CH{ch}_I"] = i
-            if "P" in metrics:
-                try:
-                    p = float(self.inst.query_str("MEASure:SCALar:POWer?").strip())
-                except Exception:
-                    p = float("nan")
-                results[f"CH{ch}_P"] = p
-        return results
-
     def _plot_tick(self):
-        if not self.plot_active:
-            return
-
-        # Interval re-read allows live changes
+        if not self.plot_active: return
         try:
-            interval = float(self.sample_interval_var.get())
-            if interval <= 0:
-                interval = 1.0
+            repaint = float(self.plot_interval_var.get()); repaint = max(0.1, repaint)
         except Exception:
-            interval = 1.0
+            repaint = 0.5
 
-        selected = self._collect_selected_keys()
-        # Sync selection: if user changes checkboxes during run, adjust lines/buffers/log header
-        # For simplicity, we keep logging columns fixed for a given run to avoid CSV inconsistency.
-        # So during an active run, we only plot selected lines that exist, but do not add/remove CSV columns.
-        # If a key is newly selected mid-run and wasn't in csv_header, it will be plotted but logged as blank (not present).
-        # If a key was deselected, we keep plotting its existing line but skip new points.
-        if self.csv_writer:
-            fixed_keys = set(self.csv_header[2:])
-        else:
-            fixed_keys = set()
+        sel = self._selected()
+        meas_msgs = []
+        event_msgs = []
 
-        try:
-            now = time.time()
-            t_rel = now - (self.start_time or now)
-            iso = datetime.utcnow().isoformat()
+        # drain everything available now
+        while True:
+            try:
+                msg = self.meas_q.get_nowait()
+            except queue.Empty:
+                break
+            tp = msg.get("type")
+            if tp == MSG_MEAS:   meas_msgs.append(msg)
+            elif tp == MSG_EVENT: event_msgs.append(msg)
+            elif tp == MSG_STATUS:
+                self.status.config(text=msg.get("msg",""))
+            elif tp == MSG_CONNECTED:
+                self.connected = True
+                self.idn_label.config(text=f"Connected: {msg.get('idn','')}")
+                self.btn_disconnect.config(state="normal")
+                self.btn_master_on.config(state="normal")
+                self.btn_master_off.config(state="normal")
+                self.btn_plot.config(state="normal")
+                self.status.config(text="Connected.")
+            elif tp == MSG_DISCONNECTED:
+                self.connected = False
+                self.idn_label.config(text="Not connected")
+                self.btn_disconnect.config(state="disabled")
+                self.btn_master_on.config(state="disabled")
+                self.btn_master_off.config(state="disabled")
+                self.btn_plot.config(state="disabled")
+                self.status.config(text="Disconnected.")
 
-            # Read instrument for currently selected series (even if not part of CSV header)
-            if selected:
-                read_keys = selected
-            else:
-                read_keys = []  # nothing to read
+        # log events
+        if self.csv_writer and event_msgs:
+            for ev in event_msgs:
+                row = [ev["iso"], f"{ev['t']:.3f}"] + [""]*len(sel) + [ev["event"], f"CH{ev['ch']}", ev["V"], ev["I"], ev["P"]]
+                self.csv_writer.writerow(row)
+            self.csv_file.flush()
 
-            values = self._read_metrics_for_selection(read_keys)
+        # update plot per meas
+        for meas in meas_msgs:
+            iso = meas["iso"]; t_rel = meas["t"]; data = meas["data"]
+            # update buffers for selected keys
+            for key in sel:
+                ch = int(key[2]); metric = key[-1]
+                chd = data.get(f"CH{ch}")
+                if chd and metric in chd:
+                    if key not in self.buffers:
+                        self.buffers[key] = deque(maxlen=100000)
+                        line, = self.ax.plot([], [], label=key)
+                        self.lines[key] = line; self.ax.legend(loc="upper left")
+                    self.buffers[key].append((t_rel, chd[metric]))
 
-            # Update buffers/lines for selected ones; if a line didn't exist (checkbox turned on mid-run), create it
-            # but only if we are not logging or logging allows it for plotting. We'll still add the line visually.
-            for key in selected:
-                if key not in self.lines:
-                    line, = self.ax.plot([], [], label=key)
-                    line.sticky_edges.x[:] = []
-                    line.sticky_edges.y[:] = []
-                    self.lines[key] = line
-                    self.ax.legend(loc="upper left")
-                if key not in self.buffers:
-                    self.buffers[key] = deque(maxlen=100000)
-                y = values.get(key, float("nan"))
-                self.buffers[key].append((t_rel, y))
-
-            # Also keep existing lines that may no longer be selected (we append nothing to them).
-
-            # Update plot data
+            # apply new data to lines
             for key, line in self.lines.items():
-                buf = self.buffers.get(key, None)
-                if buf and len(buf) > 0:
-                    xs = [pt[0] for pt in buf]
-                    ys = [pt[1] for pt in buf]
+                buf = self.buffers.get(key)
+                if buf:
+                    xs = [p[0] for p in buf]; ys = [p[1] for p in buf]
                     line.set_data(xs, ys)
-            # Adjust x-limits to last PLOT_HISTORY_SEC seconds
+
             xmin = max(0.0, t_rel - PLOT_HISTORY_SEC)
             xmax = max(10.0, t_rel if t_rel > 10 else 10.0)
             self.ax.set_xlim(xmin, xmax)
 
-            # --- Robust Y padding (works even for constant signals) ---
+            # robust y padding
             all_ys = []
-            for key, line in self.lines.items():
-                xdata = line.get_xdata()
-                ydata = line.get_ydata()
-                # filter to visible x-range only
-                ys_vis = [y for x, y in zip(xdata, ydata) if x >= xmin]
-                all_ys.extend(ys_vis)
-
+            for line in self.lines.values():
+                xs = line.get_xdata(); ys = line.get_ydata()
+                all_ys += [y for x,y in zip(xs,ys) if x>=xmin]
             if all_ys:
-                ymin = min(all_ys)
-                ymax = max(all_ys)
-                yrange = ymax - ymin
-                if yrange < 1e-9:
-                    # Flat/near-flat: center around value with absolute + relative pad
-                    ymid = 0.5 * (ymin + ymax)
-                    abs_pad = max(0.5, 0.05 * max(abs(ymid), 1.0))  # e.g., 5V => ±0.5V
-                    self.ax.set_ylim(ymid - abs_pad, ymid + abs_pad)
+                ymin, ymax = min(all_ys), max(all_ys); yr = ymax - ymin
+                if yr < 1e-9:
+                    ymid = 0.5*(ymin+ymax); pad = max(0.5, 0.05*max(abs(ymid),1.0))
+                    self.ax.set_ylim(ymid - pad, ymid + pad)
                 else:
-                    rel_pad = 0.1 * yrange
-                    abs_pad = 0.05 * max(abs(ymax), abs(ymin), 1.0)
-                    pad = max(rel_pad, abs_pad)
+                    pad = max(0.1*yr, 0.05*max(abs(ymax),abs(ymin),1.0))
                     self.ax.set_ylim(ymin - pad, ymax + pad)
 
             self.canvas.draw_idle()
 
-            # Write CSV row with fixed header subset
+            # write GUI sample row
             if self.csv_writer:
                 row = [iso, f"{t_rel:.3f}"]
-                for key in self.csv_header[2:]:
-                    if key in values:
-                        row.append(values[key])
-                    else:
-                        # If a key is in header but not read this tick (e.g., deselected now), try buffers latest
-                        if key in self.buffers and len(self.buffers[key]) > 0:
-                            row.append(self.buffers[key][-1][1])
-                        else:
-                            row.append("")
+                for key in sel:
+                    ch = int(key[2]); metric = key[-1]
+                    chd = data.get(f"CH{ch}")
+                    row.append(chd[metric] if chd and metric in chd else "")
+                row += ["","","",""]
                 self.csv_writer.writerow(row)
-                if self.log_file:
-                    self.log_file.flush()
+                self.csv_file.flush()
 
-        except Exception as ex:
-            # Show error but keep loop running
-            self.status.config(text=f"Plot tick error: {ex}")
-
-        # Schedule next tick
         if self.plot_active:
-            self.after(int(interval * 1000), self._plot_tick)
+            self.after(int(repaint*1000), self._plot_tick)
 
-    # --------------------------- End Plot & Logging ---------------------------
-
+    # ---------- teardown ----------
+    def destroy(self):
+        try: self.stop_plot()
+        except Exception: pass
+        try: self.cmd_q.put({"type": CMD_QUIT})
+        except Exception: pass
+        try:
+            if self.worker.is_alive():
+                self.worker.join(timeout=2.0)
+        except Exception:
+            pass
+        super().destroy()
 
 def main():
-    app = NGEGui()
+    mp.set_start_method("spawn", force=True)
+    app = App()
     app.mainloop()
-
 
 if __name__ == "__main__":
     main()
