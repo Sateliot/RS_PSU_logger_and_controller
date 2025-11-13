@@ -5,6 +5,7 @@
 import os
 import csv
 import math
+import time 
 import queue
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -54,6 +55,8 @@ class App(tk.Tk):
 
         # State
         self.connected = False
+        self.plot_active = False
+        self._starting_plot = False
         self.poll_interval_var = tk.StringVar(value="0.5")   # worker sampling
         self.plot_interval_var = tk.StringVar(value="0.5")   # repaint cadence
         self.series_vars = {}
@@ -157,9 +160,20 @@ class App(tk.Tk):
                 break
             tp = msg.get("type")
             if tp == MSG_STATUS:
-                self.status.config(text=msg.get("msg",""))
+                text = msg.get("msg","")
+                self.status.config(text=text)
+
+                if text.startswith("Connected:"):
+                    self.connected = True
+                    self.idn_label.config(text=text)  # shows 'Connected: <IDN>'
+                    self.btn_disconnect.config(state="normal")
+                    self.btn_master_on.config(state="normal")
+                    self.btn_master_off.config(state="normal")
+                    self.btn_plot.config(state="normal")
+
                 if not msg.get("ok", True) and "Connect failed" in msg.get("msg",""):
                     messagebox.showerror("Connection", msg.get("msg",""))
+
             elif tp == MSG_CONNECTED:
                 self.connected = True
                 self.idn_label.config(text=f"Connected: {msg.get('idn','')}")
@@ -188,7 +202,7 @@ class App(tk.Tk):
 
     def _drain_messages_plot_buffer(self):
         # This doesn’t draw; it just ensures the queue doesn’t pile up when not plotting
-        if not self.plot_active:
+        if not getattr(self, "plot_active", False) and not getattr(self, "_starting_plot", False):
             # Drop old measurement bursts (we only need the last few for a quick redraw later)
             trimmed = 0
             while True:
@@ -264,8 +278,10 @@ class App(tk.Tk):
 
     # ---------- Plot & logging ----------
     def toggle_plot(self):
-        if not self.plot_active: self.start_plot()
-        else: self.stop_plot()
+        if not getattr(self, "plot_active", False):
+            self.start_plot()
+        else: 
+            self.stop_plot()
 
     def _selected(self): return [k for k,v in self.series_vars.items() if v.get()]
 
@@ -340,7 +356,17 @@ class App(tk.Tk):
             if tp == MSG_MEAS:   meas_msgs.append(msg)
             elif tp == MSG_EVENT: event_msgs.append(msg)
             elif tp == MSG_STATUS:
-                self.status.config(text=msg.get("msg",""))
+                text = msg.get("msg","")
+                self.status.config(text=text)
+
+                if text.startswith("Connected:"):
+                    self.connected = True
+                    self.idn_label.config(text=text)
+                    self.btn_disconnect.config(state="normal")
+                    self.btn_master_on.config(state="normal")
+                    self.btn_master_off.config(state="normal")
+                    self.btn_plot.config(state="normal")
+
             elif tp == MSG_CONNECTED:
                 self.connected = True
                 self.idn_label.config(text=f"Connected: {msg.get('idn','')}")

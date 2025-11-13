@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # rs_psu_worker.py
 # Watchdog process for R&S NGE series. Owns VISA. Enforces power limits, streams measurements.
+# Threaded design: a command thread fills an internal action queue; the poll loop executes
+# a bounded number of actions per cycle, then polls/enforces. VISA is only touched by poll thread.
 
 import math
 import time
 import queue
+import threading
 import multiprocessing as mp
 from datetime import datetime
 
@@ -31,11 +34,12 @@ MSG_DISCONNECTED = "disconnected"
 MSG_MEAS         = "meas"
 MSG_EVENT        = "event"
 
-# ---- Defaults / limits ----
+# ---- Limits ----
 MAX_VOLT, MIN_VOLT = 32.0, 0.0
 MAX_CURR, MIN_CURR = 3.0, 0.0
 ABSOLUTE_MAX_PWR   = MAX_VOLT * MAX_CURR
 
+# ---- Utils ----
 def now_iso() -> str:
     return datetime.utcnow().isoformat()
 
@@ -50,32 +54,39 @@ def ffloat(v, default=float("inf")) -> float:
 
 class Watchdog(mp.Process):
     """
-    Sole VISA owner. Polls CH1..CH3 at interval, enforces soft/hard power limits,
-    streams measurements and events to GUI via meas_q, and consumes commands via cmd_q.
+    Sole VISA owner. Command thread takes GUI commands -> enqueues actions.
+    Poll thread (self.run) executes a bounded number of actions, then polls/enforces.
     """
+
     def __init__(self, cmd_q: mp.Queue, meas_q: mp.Queue, init_interval: float = 0.5):
         super().__init__(daemon=True)
-        self.cmd_q   = cmd_q
-        self.meas_q  = meas_q
-        self.interval = max(0.05, float(init_interval))
-        self.inst     = None
+        # IPC queues
+        self.cmd_q  = cmd_q
+        self.meas_q = meas_q
+
+        # Control
+        self.interval = max(0.05, float(init_interval))   # polling interval (seconds)
+        self.max_actions_per_cycle = 10                   # prevent command starvation of polling
+
+        # VISA / connection
+        self.inst = None
         self.resource = None
         self.connected = False
 
-        # setpoints and limits
+        # Setpoints and limits (shared read by poll thread; written by command thread)
         self.v_set = {1: 0.0, 2: 0.0, 3: 0.0}
         self.i_set = {1: 0.0, 2: 0.0, 3: 0.0}
         self.lim_soft = {1: float("inf"), 2: float("inf"), 3: float("inf")}
         self.lim_hard = {1: float("inf"), 2: float("inf"), 3: float("inf")}
 
-        # crossings / latching
+        # Crossings / latching
         self.prev_soft = {1: False, 2: False, 3: False}
         self.prev_hard = {1: False, 2: False, 3: False}
         self.latched   = {1: False, 2: False, 3: False}  # require P <= soft to clear
 
         self.start_t = time.time()
-
-    # ---------- helpers ----------
+    
+    # ---------------- Sending back to GUI ----------------
     def _send(self, obj: dict):
         try:
             self.meas_q.put_nowait(obj)
@@ -85,7 +96,7 @@ class Watchdog(mp.Process):
     def _status(self, ok: bool, msg: str):
         self._send({"type": MSG_STATUS, "ok": ok, "msg": msg})
 
-    # ---------- VISA ----------
+    # ---------------- VISA helpers (only call from poll thread) ----------------
     def _connect(self, resource: str):
         if not RSINSTR_AVAILABLE:
             self._status(False, "RsInstrument not available in worker")
@@ -93,7 +104,7 @@ class Watchdog(mp.Process):
         try:
             self.inst = RsInstrument(resource, id_query=True, reset=True, options="SelectVisa='rs',")
             self.inst.assert_minimum_version("1.53.0")
-            # Shorter timeouts reduce stalls
+            # Tighter timeouts avoid long stalls
             self.inst.visa_timeout = 2000  # ms
             self.inst.opc_timeout  = 2000
             try:
@@ -129,7 +140,8 @@ class Watchdog(mp.Process):
     def _sel(self, ch: int):
         self.inst.write(f"INSTrument:NSELect {ch}")
 
-    def _set_vi(self, ch: int, v: float, i: float) -> bool:
+    def _set_vi(self, ch: int, v: float, i: float):
+        # shadow setpoints
         self.v_set[ch] = float(v)
         self.i_set[ch] = float(i)
         try:
@@ -137,9 +149,9 @@ class Watchdog(mp.Process):
             self.inst.write(f"SOURce:VOLTage:LEVel:IMMediate:AMPLitude {v}")
             self.inst.write(f"SOURce:CURRent:LEVel:IMMediate:AMPLitude {i}")
             self.inst.query_opc()
-            return True
-        except Exception:
-            return False
+            self._status(True, f"CH{ch} set VI {v},{i}")
+        except Exception as ex:
+            self._status(False, f"CH{ch} set VI failed: {ex}")
 
     def _toggle_ch(self, ch: int):
         try:
@@ -150,16 +162,16 @@ class Watchdog(mp.Process):
                 state = 0
             new_state = 0 if state else 1
             self.inst.write(f"OUTPut:STATe {new_state}")
-            return new_state
-        except Exception:
-            return None
+            self._status(True, f"CH{ch} toggled -> {'ON' if new_state else 'OFF'}")
+        except Exception as ex:
+            self._status(False, f"CH{ch} toggle failed: {ex}")
 
-    def _master(self, on: bool) -> bool:
+    def _master(self, on: bool):
         try:
             self.inst.write(f"OUTPut:GENeral {1 if on else 0}")
-            return True
-        except Exception:
-            return False
+            self._status(True, f"Master {'ON' if on else 'OFF'}")
+        except Exception as ex:
+            self._status(False, f"Master failed: {ex}")
 
     def _read_vip(self, ch: int):
         try:
@@ -185,7 +197,7 @@ class Watchdog(mp.Process):
         except Exception:
             pass
 
-    # ---------- limits ----------
+    # ---------------- Limits & Events ----------------
     def _event(self, ch, v, i, p, label):
         self._send({
             "type":  MSG_EVENT,
@@ -201,7 +213,7 @@ class Watchdog(mp.Process):
     def _set_limits(self, ch: int, soft, hard):
         self.lim_soft[ch] = ffloat(soft)
         self.lim_hard[ch] = ffloat(hard)
-        return True
+        self._status(True, f"CH{ch} limits updated (soft={self.lim_soft[ch]}, hard={self.lim_hard[ch]})")
 
     def _check_limits(self, ch: int, v: float, i: float, p: float):
         soft = self.lim_soft[ch]
@@ -234,51 +246,95 @@ class Watchdog(mp.Process):
             self._event(ch, v, i, p, f"CH{ch}_HARD_CROSS_DOWN")
         self.prev_hard[ch] = hard_now
 
-    # ---------- main loop ----------
-    def run(self):
-        while True:
-            t0 = time.time()
+    # ---------------- Action execution (poll thread only) ----------------
+    def _exec_action(self, act: dict):
+        """Execute a single action dict; only called from poll/enforce thread."""
+        tp = act.get("type")
+        if tp == CMD_CONNECT:
+            self._connect(act.get("resource", ""))
+        elif tp == CMD_DISCONNECT:
+            self._disconnect()
+        elif tp == CMD_SET_VI and self.connected and self.inst:
+            self._set_vi(int(act["ch"]), float(act["v"]), float(act["i"]))
+        elif tp == CMD_TOGGLE_CH and self.connected and self.inst:
+            self._toggle_ch(int(act["ch"]))
+        elif tp == CMD_MASTER and self.connected and self.inst:
+            self._master(bool(act["on"]))
+        elif tp == CMD_SET_LIMITS:
+            self._set_limits(int(act["ch"]), act.get("soft"), act.get("hard"))
+        # CMD_SET_INTERVAL is handled by cmd thread (no VISA)
 
-            # drain commands
-            while True:
+    # ---------------- Command thread ----------------
+    def _cmd_loop(self):
+        """Runs in its own thread; translates GUI commands into internal actions or state updates."""
+        while not self.stop_evt.is_set():
+            try:
+                cmd = self.cmd_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if not isinstance(cmd, dict):
+                continue
+            tp = cmd.get("type")
+
+            if tp == CMD_QUIT:
+                # enqueue a disconnect so poll thread closes VISA cleanly
+                try: self._actions.put_nowait({"type": CMD_DISCONNECT})
+                except Exception: pass
+                self.stop_evt.set()
+                break
+
+            elif tp == CMD_CONNECT:
+                try: self._actions.put_nowait({"type": CMD_CONNECT, "resource": cmd.get("resource","")})
+                except Exception: pass
+
+            elif tp == CMD_DISCONNECT:
+                try: self._actions.put_nowait({"type": CMD_DISCONNECT})
+                except Exception: pass
+
+            elif tp == CMD_SET_INTERVAL:
                 try:
-                    cmd = self.cmd_q.get_nowait()
+                    self.interval = max(0.05, float(cmd.get("interval", self.interval)))
+                    self._status(True, f"Interval set to {self.interval}s")
+                except Exception as ex:
+                    self._status(False, f"Interval error: {ex}")
+
+            elif tp == CMD_SET_VI:
+                try: self._actions.put_nowait({"type": CMD_SET_VI, "ch": int(cmd["ch"]), "v": float(cmd["v"]), "i": float(cmd["i"])})
+                except Exception: pass
+
+            elif tp == CMD_TOGGLE_CH:
+                try: self._actions.put_nowait({"type": CMD_TOGGLE_CH, "ch": int(cmd["ch"])})
+                except Exception: pass
+
+            elif tp == CMD_MASTER:
+                try: self._actions.put_nowait({"type": CMD_MASTER, "on": bool(cmd["on"])})
+                except Exception: pass
+
+            elif tp == CMD_SET_LIMITS:
+                try: self._actions.put_nowait({"type": CMD_SET_LIMITS, "ch": int(cmd["ch"]), "soft": cmd.get("soft"), "hard": cmd.get("hard")})
+                except Exception: pass
+
+    # ---------------- Main poll/enforce loop (process main thread) ----------------
+    def run(self):
+        self.stop_evt = mp.Event()
+        # Internal action queue (threading queue; only poll thread executes actions)
+        self._actions = queue.Queue()
+        # Start command thread
+        t = threading.Thread(target=self._cmd_loop, daemon=True)
+        t.start()
+
+        while not self.stop_evt.is_set():
+            cycle_start = time.time()
+
+            # 1) Execute a bounded number of pending actions to avoid starvation
+            for _ in range(self.max_actions_per_cycle):
+                try:
+                    act = self._actions.get_nowait()
                 except queue.Empty:
                     break
-                if not isinstance(cmd, dict):
-                    continue
-                tp = cmd.get("type")
-                if tp == CMD_CONNECT:
-                    self._connect(cmd.get("resource", ""))
-                elif tp == CMD_DISCONNECT:
-                    self._disconnect()
-                elif tp == CMD_QUIT:
-                    self._disconnect()
-                    return
-                elif not self.connected or self.inst is None:
-                    # ignore mutating commands when not connected
-                    continue
-                elif tp == CMD_SET_INTERVAL:
-                    try:
-                        self.interval = max(0.05, float(cmd.get("interval", self.interval)))
-                        self._status(True, f"Interval set to {self.interval}s")
-                    except Exception as ex:
-                        self._status(False, f"Interval error: {ex}")
-                elif tp == CMD_SET_VI:
-                    ok = self._set_vi(int(cmd["ch"]), float(cmd["v"]), float(cmd["i"]))
-                    self._status(ok, f"CH{cmd['ch']} set VI {cmd['v']},{cmd['i']}")
-                elif tp == CMD_TOGGLE_CH:
-                    new = self._toggle_ch(int(cmd["ch"]))
-                    self._status(new is not None, f"CH{cmd['ch']} toggled")
-                elif tp == CMD_MASTER:
-                    ok = self._master(bool(cmd["on"]))
-                    self._status(ok, f"Master {'ON' if cmd['on'] else 'OFF'}")
-                elif tp == CMD_SET_LIMITS:
-                    ch = int(cmd["ch"])
-                    ok = self._set_limits(ch, cmd.get("soft"), cmd.get("hard"))
-                    self._status(ok, f"CH{ch} limits updated")
+                self._exec_action(act)
 
-            # Poll + enforce
+            # 2) Poll + enforce
             if self.connected and self.inst:
                 iso = now_iso()
                 t_rel = time.time() - self.start_t
@@ -289,12 +345,18 @@ class Watchdog(mp.Process):
                         continue
                     data[f"CH{ch}"] = {"V": v, "I": i, "P": p}
                     self._check_limits(ch, v, i, p)
-
                 if data:
                     self._send({"type": MSG_MEAS, "iso": iso, "t": t_rel, "data": data})
 
-            # sleep remainder
-            dt = time.time() - t0
+            # 3) Sleep remainder of interval
+            dt = time.time() - cycle_start
             rest = self.interval - dt
             if rest > 0:
                 time.sleep(rest)
+
+        # Graceful shutdown
+        try:
+            if self.connected:
+                self._disconnect()
+        except Exception:
+            pass
