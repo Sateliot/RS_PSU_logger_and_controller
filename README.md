@@ -32,7 +32,7 @@ Live Plot & Log
 Status Bar
     Shows connection state, worker status, and any errors.
 
-![Screenshot of the GUI.](https://https://github.com/Sateliot/RS_PSU_logger_and_controller/blob/main/GUI_screenshot.png)
+![Screenshot of the GUI.](https://github.com/Sateliot/RS_PSU_logger_and_controller/blob/main/GUI_screenshot.png)
 
 
 NOTES
