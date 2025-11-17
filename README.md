@@ -36,11 +36,7 @@ Shows connection state, worker status, and any errors.
 
 ![Screenshot of the GUI.](https://github.com/Sateliot/RS_PSU_logger_and_controller/blob/main/GUI_screenshot.png)
 
-<<<<<<< Updated upstream
 # NOTES
-=======
-# GUI NOTES
->>>>>>> Stashed changes
 -----
 - **A CSV log is created only while "Start Plot" is active**.
 - Limits are enforced in the background by the worker process.
