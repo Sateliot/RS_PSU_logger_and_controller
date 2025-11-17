@@ -1,7 +1,3 @@
-========================================
-PSU CONTROL APPLICATION - README
-========================================
-
 HOW TO RUN
 ----------
 From a terminal or PowerShell:
@@ -35,6 +31,8 @@ Live Plot & Log
 
 Status Bar
     Shows connection state, worker status, and any errors.
+
+![Screenshot of the GUI.](https://)
 
 
 NOTES
